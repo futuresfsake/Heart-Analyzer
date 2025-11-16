@@ -1,0 +1,12 @@
+# 1. Create a new React project with Vite (recommended - faster)
+npm create vite@latest heart-rate-analyzer -- --template react
+cd heart-rate-analyzer
+
+# 2. Install the required dependencies
+npm install recharts lucide-react
+
+# 3. Replace the contents of src/App.jsx with my code
+
+# 4. Start the development server
+npm run dev
+npm run dev -- heart-rate-analyzer root folder
