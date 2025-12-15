@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
 import { Upload, Heart, Activity, TrendingUp, AlertCircle } from 'lucide-react';
+import { fft } from "fft-js";
+import { util as fftUtil } from "fft-js";
 import './App.css';
 interface HeartRateData {
   index: number;
@@ -19,6 +21,7 @@ interface Analysis {
   anomalies: number;
   interpretation: string[];
   movingAvg: (HeartRateData & { smoothed: number })[];
+  fftBpm: string; 
 }
 
 export default function HeartRateAnalyzer() {
@@ -28,7 +31,11 @@ export default function HeartRateAnalyzer() {
 
   const parseCSV = (text: string): HeartRateData[] => {
     const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map((h: string) => h.trim().toLowerCase());
+    if (lines.length === 0) {
+      throw new Error('CSV file is empty');
+    }
+    
+    const headers = lines[0]?.split(',').map((h: string) => h.trim().toLowerCase()) || [];
     
     // Find relevant columns
     const timeCol = headers.findIndex((h: string) => h.includes('time') || h.includes('timestamp') || h.includes('date'));
@@ -40,13 +47,13 @@ export default function HeartRateAnalyzer() {
 
     const parsed = [];
     for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(',');
-      if (values.length > hrCol) {
+      const values = lines[i]?.split(',') || [];
+      if (values.length > hrCol && values[hrCol]) {
         const hr = parseFloat(values[hrCol]);
         if (!isNaN(hr)) {
           parsed.push({
             index: i - 1,
-            time: timeCol !== -1 ? values[timeCol].trim() : `${i - 1}`,
+            time: timeCol !== -1 && values[timeCol] ? values[timeCol].trim() : `${i - 1}`,
             heartRate: hr
           });
         }
@@ -58,6 +65,38 @@ export default function HeartRateAnalyzer() {
     }
     
     return parsed;
+  };
+
+  // new: fourier transform
+  const detectBPMUsingFFT = (signal: number[], samplingRate: number): number => {
+    const n = signal.length;
+    if (n === 0) return 0;
+
+    const mean = signal.reduce((a, b) => a + b, 0) / n;
+    const centered = signal.map(v => v - mean);
+
+    // FFT
+    const phasors = fft(centered);
+    const magnitudes = fftUtil.fftMag(phasors);
+    if (!magnitudes || magnitudes.length === 0) return 0;
+
+    const freqResolution = samplingRate / n;
+
+    let maxMag = 0;
+    let dominantIndex = 0;
+
+    // Ignore DC, search useful range
+    for (let i = 1; i < magnitudes.length / 2; i++) {
+      const freq = i * freqResolution;
+      const bpm = freq * 60;
+
+      // Physiological heart rate range
+      if (bpm >= 40 && bpm <= 180 && magnitudes[i] > maxMag) {
+        maxMag = magnitudes[i];
+        dominantIndex = i;
+      }
+    }
+    return dominantIndex * freqResolution * 60;
   };
 
   const analyzeData = (data: HeartRateData[]): Analysis => {
@@ -75,7 +114,7 @@ export default function HeartRateAnalyzer() {
     const stdDev = Math.sqrt(variance);
     
     // Moving average (convolution with uniform kernel)
-    const windowSize = Math.min(10, Math.floor(n / 5));
+    const windowSize = Math.max(3, Math.min(10, Math.floor(n / 5)));
     const movingAvg: number[] = [];
     for (let i = 0; i < n; i++) {
       const start = Math.max(0, i - Math.floor(windowSize / 2));
@@ -83,6 +122,14 @@ export default function HeartRateAnalyzer() {
       const window = hrs.slice(start, end);
       movingAvg.push(window.reduce((a: number, b: number) => a + b, 0) / window.length);
     }
+
+    // FFT-based BPM detection
+    let fftBpm = 0;
+    if (movingAvg.length >= 8) {
+      const samplingRate = 1; // 1 sample per second (from CSV)
+      fftBpm = detectBPMUsingFFT(movingAvg, samplingRate);
+    }
+
     
     // Heart Rate Variability (RMSSD approximation)
     let sumSquaredDiffs = 0;
@@ -100,8 +147,8 @@ export default function HeartRateAnalyzer() {
     let trend = 'stable';
     const firstHalf = movingAvg.slice(0, Math.floor(n / 2));
     const secondHalf = movingAvg.slice(Math.floor(n / 2));
-    const firstAvg = firstHalf.reduce((a: number, b: number) => a + b, 0) / firstHalf.length;
-    const secondAvg = secondHalf.reduce((a: number, b: number) => a + b, 0) / secondHalf.length;
+    const firstAvg = firstHalf.length > 0 ? firstHalf.reduce((a: number, b: number) => a + b, 0) / firstHalf.length : 0;
+    const secondAvg = secondHalf.length > 0 ? secondHalf.reduce((a: number, b: number) => a + b, 0) / secondHalf.length : 0;
     const trendDiff = secondAvg - firstAvg;
     
     if (trendDiff > 5) trend = 'increasing';
@@ -139,6 +186,17 @@ export default function HeartRateAnalyzer() {
     if (anomalies.length > 0) {
       interpretation.push(`${anomalies.length} anomalous readings detected that deviate significantly from the average`);
     }
+
+    // new interpretation for fft
+    if (fftBpm > 0) {
+      interpretation.push(
+        `Frequency-domain analysis using Fast Fourier Transform estimates an average heart rate of approximately ${fftBpm.toFixed(1)} bpm`
+      );
+    } else {
+      interpretation.push(
+        'Frequency-domain analysis could not reliably estimate heart rate due to insufficient data length'
+      );
+    }
     
     return {
       mean: mean.toFixed(1),
@@ -150,13 +208,15 @@ export default function HeartRateAnalyzer() {
       trend,
       anomalies: anomalies.length,
       interpretation,
+      fftBpm: fftBpm.toFixed(1),
       movingAvg: data.map((d: HeartRateData, i: number) => ({ ...d, smoothed: movingAvg[i] }))
     };
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const file = files[0];
     
     setError(null);
     const reader = new FileReader();
@@ -208,7 +268,7 @@ export default function HeartRateAnalyzer() {
 
         {analysis && data && (
           <>
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
               <div className="bg-white rounded-lg shadow p-4">
                 <div className="flex items-center gap-2 mb-2">
                   <Heart className="w-5 h-5 text-red-500" />
@@ -244,6 +304,16 @@ export default function HeartRateAnalyzer() {
                 <div className="text-2xl font-bold text-gray-800 capitalize">{analysis.trend}</div>
                 <div className="text-xs text-gray-500">{analysis.anomalies} anomalies</div>
               </div>
+
+              <div className="bg-white rounded-lg shadow p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <Activity className="w-5 h-5 text-purple-500" />
+                  <span className="text-sm text-gray-600">FFT BPM</span>
+                </div>
+                <div className="text-3xl font-bold text-gray-800">{analysis.fftBpm !== "0.0" ? analysis.fftBpm : "N/A"}</div>
+                <div className="text-xs text-gray-500">auto-detected</div>
+              </div>
+
             </div>
 
             <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
