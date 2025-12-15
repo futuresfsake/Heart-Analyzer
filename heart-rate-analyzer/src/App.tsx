@@ -1,13 +1,20 @@
 import React, { useState } from 'react';
-import { Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
-import { Upload, Heart, Activity, TrendingUp, AlertCircle } from 'lucide-react';
-import { fft } from "fft-js";
-import { util as fftUtil } from "fft-js";
+import { 
+  Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, 
+  Area, AreaChart, BarChart, Bar 
+} from 'recharts';
+import { Upload, Heart, Activity, TrendingUp, AlertCircle, BarChart2 } from 'lucide-react';
 import './App.css';
+
 interface HeartRateData {
   index: number;
   time: string;
   heartRate: number;
+}
+
+interface FFTData {
+  frequency: number;
+  magnitude: number;
 }
 
 interface Analysis {
@@ -21,7 +28,8 @@ interface Analysis {
   anomalies: number;
   interpretation: string[];
   movingAvg: (HeartRateData & { smoothed: number })[];
-  fftBpm: string; 
+  fftSpectrum: FFTData[];
+  dominantFrequency: string; 
 }
 
 export default function HeartRateAnalyzer() {
@@ -37,7 +45,6 @@ export default function HeartRateAnalyzer() {
     
     const headers = lines[0]?.split(',').map((h: string) => h.trim().toLowerCase()) || [];
     
-    // Find relevant columns
     const timeCol = headers.findIndex((h: string) => h.includes('time') || h.includes('timestamp') || h.includes('date'));
     const hrCol = headers.findIndex((h: string) => h.includes('heart') || h.includes('hr') || h.includes('bpm') || h.includes('rate'));
     
@@ -67,53 +74,43 @@ export default function HeartRateAnalyzer() {
     return parsed;
   };
 
-  // new: fourier transform
-  const detectBPMUsingFFT = (signal: number[], samplingRate: number): number => {
-    const n = signal.length;
-    if (n === 0) return 0;
-
-    const mean = signal.reduce((a, b) => a + b, 0) / n;
-    const centered = signal.map(v => v - mean);
-
-    // FFT
-    const phasors = fft(centered);
-    const magnitudes = fftUtil.fftMag(phasors);
-    if (!magnitudes || magnitudes.length === 0) return 0;
-
-    const freqResolution = samplingRate / n;
-
-    let maxMag = 0;
-    let dominantIndex = 0;
-
-    // Ignore DC, search useful range
-    for (let i = 1; i < magnitudes.length / 2; i++) {
-      const freq = i * freqResolution;
-      const bpm = freq * 60;
-
-      // Physiological heart rate range
-      if (bpm >= 40 && bpm <= 180 && magnitudes[i] > maxMag) {
-        maxMag = magnitudes[i];
-        dominantIndex = i;
+  const calculateFFT = (signal: number[], samplingRate: number = 1): FFTData[] => {
+    const N = signal.length;
+    const spectrum: FFTData[] = [];
+    
+    for (let k = 0; k < N / 2; k++) {
+      let real = 0;
+      let imag = 0;
+      
+      for (let n = 0; n < N; n++) {
+        const angle = (2 * Math.PI * k * n) / N;
+        real += signal[n] * Math.cos(angle);
+        imag -= signal[n] * Math.sin(angle);
       }
+      
+      const magnitude = Math.sqrt(real * real + imag * imag);
+      
+      spectrum.push({
+        frequency: parseFloat(((k * samplingRate) / N).toFixed(3)),
+        magnitude: parseFloat(magnitude.toFixed(2))
+      });
     }
-    return dominantIndex * freqResolution * 60;
+    
+    return spectrum;
   };
 
   const analyzeData = (data: HeartRateData[]): Analysis => {
     const hrs = data.map((d: HeartRateData) => d.heartRate);
     const n = hrs.length;
     
-    // Basic statistics
     const mean = hrs.reduce((a: number, b: number) => a + b, 0) / n;
     const min = Math.min(...hrs);
     const max = Math.max(...hrs);
     const range = max - min;
     
-    // Standard deviation
     const variance = hrs.reduce((sum: number, hr: number) => sum + Math.pow(hr - mean, 2), 0) / n;
     const stdDev = Math.sqrt(variance);
     
-    // Moving average (convolution with uniform kernel)
     const windowSize = Math.max(3, Math.min(10, Math.floor(n / 5)));
     const movingAvg: number[] = [];
     for (let i = 0; i < n; i++) {
@@ -123,27 +120,23 @@ export default function HeartRateAnalyzer() {
       movingAvg.push(window.reduce((a: number, b: number) => a + b, 0) / window.length);
     }
 
-    // FFT-based BPM detection
-    let fftBpm = 0;
-    if (movingAvg.length >= 8) {
-      const samplingRate = 1; // 1 sample per second (from CSV)
-      fftBpm = detectBPMUsingFFT(movingAvg, samplingRate);
-    }
-
+    const fftSpectrum = calculateFFT(hrs, 1);
     
-    // Heart Rate Variability (RMSSD approximation)
+    const spectrumNoDC = fftSpectrum.slice(1);
+    const dominantBin = spectrumNoDC.reduce((prev, current) => 
+      (prev.magnitude > current.magnitude) ? prev : current
+    , spectrumNoDC[0] || { frequency: 0, magnitude: 0 });
+
     let sumSquaredDiffs = 0;
     for (let i = 1; i < n; i++) {
       sumSquaredDiffs += Math.pow(hrs[i] - hrs[i - 1], 2);
     }
     const rmssd = Math.sqrt(sumSquaredDiffs / (n - 1));
     
-    // Detect anomalies (values beyond 2 std devs)
     const anomalies = data.filter((d: HeartRateData) => 
       Math.abs(d.heartRate - mean) > 2 * stdDev
     );
     
-    // Trend detection
     let trend = 'stable';
     const firstHalf = movingAvg.slice(0, Math.floor(n / 2));
     const secondHalf = movingAvg.slice(Math.floor(n / 2));
@@ -154,49 +147,26 @@ export default function HeartRateAnalyzer() {
     if (trendDiff > 5) trend = 'increasing';
     else if (trendDiff < -5) trend = 'decreasing';
     
-    // Interpretation
     let interpretation: string[] = [];
     
     if (mean >= 60 && mean <= 100) {
-      interpretation.push('Average heart rate is within normal resting range (60-100 bpm)');
+      interpretation.push('Average heart rate is within normal resting range (60-100 bpm).');
     } else if (mean < 60) {
-      interpretation.push('Average heart rate suggests bradycardia (below 60 bpm) - possibly athletic or needs medical attention');
+      interpretation.push('Average heart rate suggests bradycardia (below 60 bpm).');
     } else {
-      interpretation.push('Average heart rate is elevated (above 100 bpm) - could indicate tachycardia, exercise, or stress');
+      interpretation.push('Average heart rate is elevated (above 100 bpm).');
     }
     
-    if (rmssd < 20) {
-      interpretation.push('Low heart rate variability detected - may indicate stress or fatigue');
-    } else if (rmssd > 50) {
-      interpretation.push('High heart rate variability - generally indicates good cardiovascular health');
-    } else {
-      interpretation.push('Moderate heart rate variability - within normal range');
-    }
-    
-    if (range > 50) {
-      interpretation.push(`Large variation in heart rate (${range.toFixed(0)} bpm range) - suggests periods of activity and rest`);
-    }
-    
-    if (trend === 'increasing') {
-      interpretation.push('Heart rate shows an increasing trend over time');
-    } else if (trend === 'decreasing') {
-      interpretation.push('Heart rate shows a decreasing trend over time');
-    }
-    
-    if (anomalies.length > 0) {
-      interpretation.push(`${anomalies.length} anomalous readings detected that deviate significantly from the average`);
+    if (dominantBin.frequency > 0 && dominantBin.frequency < 0.04) {
+      interpretation.push('Dominant Very Low Frequency (VLF) detected - may relate to thermoregulation or hormonal cycles.');
+    } else if (dominantBin.frequency >= 0.04 && dominantBin.frequency < 0.15) {
+      interpretation.push('Dominant Low Frequency (LF) detected - associated with Baroreflex activity (blood pressure regulation).');
+    } else if (dominantBin.frequency >= 0.15 && dominantBin.frequency < 0.4) {
+      interpretation.push('Dominant High Frequency (HF) detected - generally associated with respiratory sinus arrhythmia (RSA) and parasympathetic activity.');
     }
 
-    // new interpretation for fft
-    if (fftBpm > 0) {
-      interpretation.push(
-        `Frequency-domain analysis using Fast Fourier Transform estimates an average heart rate of approximately ${fftBpm.toFixed(1)} bpm`
-      );
-    } else {
-      interpretation.push(
-        'Frequency-domain analysis could not reliably estimate heart rate due to insufficient data length'
-      );
-    }
+    if (trend === 'increasing') interpretation.push('Heart rate shows an increasing trend over time.');
+    else if (trend === 'decreasing') interpretation.push('Heart rate shows a decreasing trend over time.');
     
     return {
       mean: mean.toFixed(1),
@@ -208,8 +178,9 @@ export default function HeartRateAnalyzer() {
       trend,
       anomalies: anomalies.length,
       interpretation,
-      fftBpm: fftBpm.toFixed(1),
-      movingAvg: data.map((d: HeartRateData, i: number) => ({ ...d, smoothed: movingAvg[i] }))
+      movingAvg: data.map((d: HeartRateData, i: number) => ({ ...d, smoothed: movingAvg[i] })),
+      fftSpectrum,
+      dominantFrequency: dominantBin.frequency.toFixed(3)
     };
   };
 
@@ -247,7 +218,7 @@ export default function HeartRateAnalyzer() {
             <Heart className="w-10 h-10 text-red-500" />
             <h1 className="text-4xl font-bold text-gray-800">Heart Rate Analyzer</h1>
           </div>
-          <p className="text-gray-600">Upload CSV data for time-series analysis and interpretation</p>
+          <p className="text-gray-600">Upload CSV data for time-series and FFT frequency analysis</p>
         </div>
 
         <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
@@ -307,13 +278,12 @@ export default function HeartRateAnalyzer() {
 
               <div className="bg-white rounded-lg shadow p-4">
                 <div className="flex items-center gap-2 mb-2">
-                  <Activity className="w-5 h-5 text-purple-500" />
-                  <span className="text-sm text-gray-600">FFT BPM</span>
+                  <BarChart2 className="w-5 h-5 text-purple-500" />
+                  <span className="text-sm text-gray-600">Dominant Freq</span>
                 </div>
-                <div className="text-3xl font-bold text-gray-800">{analysis.fftBpm !== "0.0" ? analysis.fftBpm : "N/A"}</div>
-                <div className="text-xs text-gray-500">auto-detected</div>
+                <div className="text-3xl font-bold text-gray-800">{analysis.dominantFrequency}</div>
+                <div className="text-xs text-gray-500">Hz (peak power)</div>
               </div>
-
             </div>
 
             <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
@@ -331,6 +301,23 @@ export default function HeartRateAnalyzer() {
               </ResponsiveContainer>
             </div>
 
+            <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+              <h2 className="text-xl font-bold text-gray-800 mb-4">Frequency Spectrum (FFT)</h2>
+              <ResponsiveContainer width="100%" height={250}>
+                <BarChart data={analysis.fftSpectrum.slice(1)}> 
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis 
+                    dataKey="frequency" 
+                    label={{ value: 'Frequency (Hz)', position: 'insideBottom', offset: -5 }} 
+                    tickFormatter={(tick) => tick.toFixed(2)}
+                  />
+                  <YAxis label={{ value: 'Magnitude', angle: -90, position: 'insideLeft' }} />
+                  <Tooltip />
+                  <Bar dataKey="magnitude" fill="#8884d8" name="Power Magnitude" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
             <div className="bg-white rounded-lg shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4">Analysis & Interpretation</h2>
               <div className="space-y-3">
@@ -344,9 +331,8 @@ export default function HeartRateAnalyzer() {
               
               <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
                 <p className="text-sm text-blue-800">
-                  <strong>Note:</strong> This analysis uses signal processing techniques including moving average convolution 
-                  for smoothing and statistical measures for pattern detection. Results are for informational purposes only 
-                  and should not replace professional medical advice.
+                  <strong>Note:</strong> This analysis uses FFT (Fast Fourier Transform) to detect dominant frequencies in your heart rate variability. 
+                  Low frequencies (LF) are often associated with blood pressure regulation, while High frequencies (HF) relate to respiration.
                 </p>
               </div>
             </div>
