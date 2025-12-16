@@ -1,11 +1,20 @@
 import React, { useState } from 'react';
-import { Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
-import { Upload, Heart, Activity, TrendingUp, AlertCircle } from 'lucide-react';
+import { 
+  Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, 
+  Area, AreaChart, BarChart, Bar 
+} from 'recharts';
+import { Upload, Heart, Activity, TrendingUp, AlertCircle, BarChart2 } from 'lucide-react';
 import './App.css';
+
 interface HeartRateData {
   index: number;
   time: string;
   heartRate: number;
+}
+
+interface FFTData {
+  frequency: number;
+  magnitude: number;
 }
 
 interface Analysis {
@@ -19,6 +28,8 @@ interface Analysis {
   anomalies: number;
   interpretation: string[];
   movingAvg: (HeartRateData & { smoothed: number })[];
+  fftSpectrum: FFTData[];
+  dominantFrequency: string; 
 }
 
 export default function HeartRateAnalyzer() {
@@ -28,9 +39,12 @@ export default function HeartRateAnalyzer() {
 
   const parseCSV = (text: string): HeartRateData[] => {
     const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map((h: string) => h.trim().toLowerCase());
+    if (lines.length === 0) {
+      throw new Error('CSV file is empty');
+    }
     
-    // Find relevant columns
+    const headers = lines[0]?.split(',').map((h: string) => h.trim().toLowerCase()) || [];
+    
     const timeCol = headers.findIndex((h: string) => h.includes('time') || h.includes('timestamp') || h.includes('date'));
     const hrCol = headers.findIndex((h: string) => h.includes('heart') || h.includes('hr') || h.includes('bpm') || h.includes('rate'));
     
@@ -40,13 +54,13 @@ export default function HeartRateAnalyzer() {
 
     const parsed = [];
     for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(',');
-      if (values.length > hrCol) {
+      const values = lines[i]?.split(',') || [];
+      if (values.length > hrCol && values[hrCol]) {
         const hr = parseFloat(values[hrCol]);
         if (!isNaN(hr)) {
           parsed.push({
             index: i - 1,
-            time: timeCol !== -1 ? values[timeCol].trim() : `${i - 1}`,
+            time: timeCol !== -1 && values[timeCol] ? values[timeCol].trim() : `${i - 1}`,
             heartRate: hr
           });
         }
@@ -60,22 +74,44 @@ export default function HeartRateAnalyzer() {
     return parsed;
   };
 
+  const calculateFFT = (signal: number[], samplingRate: number = 1): FFTData[] => {
+    const N = signal.length;
+    const spectrum: FFTData[] = [];
+    
+    for (let k = 0; k < N / 2; k++) {
+      let real = 0;
+      let imag = 0;
+      
+      for (let n = 0; n < N; n++) {
+        const angle = (2 * Math.PI * k * n) / N;
+        real += signal[n] * Math.cos(angle);
+        imag -= signal[n] * Math.sin(angle);
+      }
+      
+      const magnitude = Math.sqrt(real * real + imag * imag);
+      
+      spectrum.push({
+        frequency: parseFloat(((k * samplingRate) / N).toFixed(3)),
+        magnitude: parseFloat(magnitude.toFixed(2))
+      });
+    }
+    
+    return spectrum;
+  };
+
   const analyzeData = (data: HeartRateData[]): Analysis => {
     const hrs = data.map((d: HeartRateData) => d.heartRate);
     const n = hrs.length;
     
-    // Basic statistics
     const mean = hrs.reduce((a: number, b: number) => a + b, 0) / n;
     const min = Math.min(...hrs);
     const max = Math.max(...hrs);
     const range = max - min;
     
-    // Standard deviation
     const variance = hrs.reduce((sum: number, hr: number) => sum + Math.pow(hr - mean, 2), 0) / n;
     const stdDev = Math.sqrt(variance);
     
-    // Moving average (convolution with uniform kernel)
-    const windowSize = Math.min(10, Math.floor(n / 5));
+    const windowSize = Math.max(3, Math.min(10, Math.floor(n / 5)));
     const movingAvg: number[] = [];
     for (let i = 0; i < n; i++) {
       const start = Math.max(0, i - Math.floor(windowSize / 2));
@@ -83,62 +119,54 @@ export default function HeartRateAnalyzer() {
       const window = hrs.slice(start, end);
       movingAvg.push(window.reduce((a: number, b: number) => a + b, 0) / window.length);
     }
+
+    const fftSpectrum = calculateFFT(hrs, 1);
     
-    // Heart Rate Variability (RMSSD approximation)
+    const spectrumNoDC = fftSpectrum.slice(1);
+    const dominantBin = spectrumNoDC.reduce((prev, current) => 
+      (prev.magnitude > current.magnitude) ? prev : current
+    , spectrumNoDC[0] || { frequency: 0, magnitude: 0 });
+
     let sumSquaredDiffs = 0;
     for (let i = 1; i < n; i++) {
       sumSquaredDiffs += Math.pow(hrs[i] - hrs[i - 1], 2);
     }
     const rmssd = Math.sqrt(sumSquaredDiffs / (n - 1));
     
-    // Detect anomalies (values beyond 2 std devs)
     const anomalies = data.filter((d: HeartRateData) => 
       Math.abs(d.heartRate - mean) > 2 * stdDev
     );
     
-    // Trend detection
     let trend = 'stable';
     const firstHalf = movingAvg.slice(0, Math.floor(n / 2));
     const secondHalf = movingAvg.slice(Math.floor(n / 2));
-    const firstAvg = firstHalf.reduce((a: number, b: number) => a + b, 0) / firstHalf.length;
-    const secondAvg = secondHalf.reduce((a: number, b: number) => a + b, 0) / secondHalf.length;
+    const firstAvg = firstHalf.length > 0 ? firstHalf.reduce((a: number, b: number) => a + b, 0) / firstHalf.length : 0;
+    const secondAvg = secondHalf.length > 0 ? secondHalf.reduce((a: number, b: number) => a + b, 0) / secondHalf.length : 0;
     const trendDiff = secondAvg - firstAvg;
     
     if (trendDiff > 5) trend = 'increasing';
     else if (trendDiff < -5) trend = 'decreasing';
     
-    // Interpretation
     let interpretation: string[] = [];
     
     if (mean >= 60 && mean <= 100) {
-      interpretation.push('Average heart rate is within normal resting range (60-100 bpm)');
+      interpretation.push('Average heart rate is within normal resting range (60-100 bpm).');
     } else if (mean < 60) {
-      interpretation.push('Average heart rate suggests bradycardia (below 60 bpm) - possibly athletic or needs medical attention');
+      interpretation.push('Average heart rate suggests bradycardia (below 60 bpm).');
     } else {
-      interpretation.push('Average heart rate is elevated (above 100 bpm) - could indicate tachycardia, exercise, or stress');
+      interpretation.push('Average heart rate is elevated (above 100 bpm).');
     }
     
-    if (rmssd < 20) {
-      interpretation.push('Low heart rate variability detected - may indicate stress or fatigue');
-    } else if (rmssd > 50) {
-      interpretation.push('High heart rate variability - generally indicates good cardiovascular health');
-    } else {
-      interpretation.push('Moderate heart rate variability - within normal range');
+    if (dominantBin.frequency > 0 && dominantBin.frequency < 0.04) {
+      interpretation.push('Dominant Very Low Frequency (VLF) detected - may relate to thermoregulation or hormonal cycles.');
+    } else if (dominantBin.frequency >= 0.04 && dominantBin.frequency < 0.15) {
+      interpretation.push('Dominant Low Frequency (LF) detected - associated with Baroreflex activity (blood pressure regulation).');
+    } else if (dominantBin.frequency >= 0.15 && dominantBin.frequency < 0.4) {
+      interpretation.push('Dominant High Frequency (HF) detected - generally associated with respiratory sinus arrhythmia (RSA) and parasympathetic activity.');
     }
-    
-    if (range > 50) {
-      interpretation.push(`Large variation in heart rate (${range.toFixed(0)} bpm range) - suggests periods of activity and rest`);
-    }
-    
-    if (trend === 'increasing') {
-      interpretation.push('Heart rate shows an increasing trend over time');
-    } else if (trend === 'decreasing') {
-      interpretation.push('Heart rate shows a decreasing trend over time');
-    }
-    
-    if (anomalies.length > 0) {
-      interpretation.push(`${anomalies.length} anomalous readings detected that deviate significantly from the average`);
-    }
+
+    if (trend === 'increasing') interpretation.push('Heart rate shows an increasing trend over time.');
+    else if (trend === 'decreasing') interpretation.push('Heart rate shows a decreasing trend over time.');
     
     return {
       mean: mean.toFixed(1),
@@ -150,13 +178,16 @@ export default function HeartRateAnalyzer() {
       trend,
       anomalies: anomalies.length,
       interpretation,
-      movingAvg: data.map((d: HeartRateData, i: number) => ({ ...d, smoothed: movingAvg[i] }))
+      movingAvg: data.map((d: HeartRateData, i: number) => ({ ...d, smoothed: movingAvg[i] })),
+      fftSpectrum,
+      dominantFrequency: dominantBin.frequency.toFixed(3)
     };
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const file = files[0];
     
     setError(null);
     const reader = new FileReader();
@@ -187,7 +218,7 @@ export default function HeartRateAnalyzer() {
             <Heart className="w-10 h-10 text-red-500" />
             <h1 className="text-4xl font-bold text-gray-800">Heart Rate Analyzer</h1>
           </div>
-          <p className="text-gray-600">Upload CSV data for time-series analysis and interpretation</p>
+          <p className="text-gray-600">Upload CSV data for time-series and FFT frequency analysis</p>
         </div>
 
         <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
@@ -208,7 +239,7 @@ export default function HeartRateAnalyzer() {
 
         {analysis && data && (
           <>
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
               <div className="bg-white rounded-lg shadow p-4">
                 <div className="flex items-center gap-2 mb-2">
                   <Heart className="w-5 h-5 text-red-500" />
@@ -244,6 +275,15 @@ export default function HeartRateAnalyzer() {
                 <div className="text-2xl font-bold text-gray-800 capitalize">{analysis.trend}</div>
                 <div className="text-xs text-gray-500">{analysis.anomalies} anomalies</div>
               </div>
+
+              <div className="bg-white rounded-lg shadow p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <BarChart2 className="w-5 h-5 text-purple-500" />
+                  <span className="text-sm text-gray-600">Dominant Freq</span>
+                </div>
+                <div className="text-3xl font-bold text-gray-800">{analysis.dominantFrequency}</div>
+                <div className="text-xs text-gray-500">Hz (peak power)</div>
+              </div>
             </div>
 
             <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
@@ -261,6 +301,23 @@ export default function HeartRateAnalyzer() {
               </ResponsiveContainer>
             </div>
 
+            <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+              <h2 className="text-xl font-bold text-gray-800 mb-4">Frequency Spectrum (FFT)</h2>
+              <ResponsiveContainer width="100%" height={250}>
+                <BarChart data={analysis.fftSpectrum.slice(1)}> 
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis 
+                    dataKey="frequency" 
+                    label={{ value: 'Frequency (Hz)', position: 'insideBottom', offset: -5 }} 
+                    tickFormatter={(tick) => tick.toFixed(2)}
+                  />
+                  <YAxis label={{ value: 'Magnitude', angle: -90, position: 'insideLeft' }} />
+                  <Tooltip />
+                  <Bar dataKey="magnitude" fill="#8884d8" name="Power Magnitude" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
             <div className="bg-white rounded-lg shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4">Analysis & Interpretation</h2>
               <div className="space-y-3">
@@ -274,9 +331,8 @@ export default function HeartRateAnalyzer() {
               
               <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
                 <p className="text-sm text-blue-800">
-                  <strong>Note:</strong> This analysis uses signal processing techniques including moving average convolution 
-                  for smoothing and statistical measures for pattern detection. Results are for informational purposes only 
-                  and should not replace professional medical advice.
+                  <strong>Note:</strong> This analysis uses FFT (Fast Fourier Transform) to detect dominant frequencies in your heart rate variability. 
+                  Low frequencies (LF) are often associated with blood pressure regulation, while High frequencies (HF) relate to respiration.
                 </p>
               </div>
             </div>
